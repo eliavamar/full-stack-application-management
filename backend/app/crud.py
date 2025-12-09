@@ -87,12 +87,22 @@ def create_activity(
     return activity
 
 
-def update_item_score(*, session: Session, item_id: uuid.UUID) -> None:
+def update_item_score(*, session: Session, item_id: uuid.UUID, depth: int = 0, max_depth: int = 1) -> None:
     """
     Update the activity score for an item based on recent activities.
     This helps identify trending items and keeps related items synchronized.
+    
+    Args:
+        session: Database session
+        item_id: ID of the item to update
+        depth: Current recursion depth (prevents infinite loops)
+        max_depth: Maximum allowed recursion depth
     """
     from app.utils import calculate_item_score, get_related_items
+    
+    # Prevent infinite recursion
+    if depth > max_depth:
+        return
     
     item = session.get(Item, item_id)
     if not item:
@@ -110,11 +120,9 @@ def update_item_score(*, session: Session, item_id: uuid.UUID) -> None:
     session.commit()
     session.refresh(item)
     
-    # BUG: Update related items' scores to keep recommendations fresh
-    # This creates a circular dependency when items share the same owner
-    related_items = get_related_items(session=session, item=item)
-    for related_item in related_items:
-        # Recursively update scores - THIS IS THE INFINITE LOOP!
-        # Update TWICE for "better accuracy" - makes it worse!
-        update_item_score(session=session, item_id=related_item.id)
-        update_item_score(session=session, item_id=related_item.id)
+    # Update related items' scores to keep recommendations fresh (with depth limiting)
+    if depth < max_depth:
+        related_items = get_related_items(session=session, item=item)
+        for related_item in related_items:
+            # Update with increased depth to prevent infinite recursion
+            update_item_score(session=session, item_id=related_item.id, depth=depth + 1)
