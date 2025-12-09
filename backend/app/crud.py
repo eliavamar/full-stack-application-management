@@ -110,11 +110,17 @@ def update_item_score(*, session: Session, item_id: uuid.UUID) -> None:
     session.commit()
     session.refresh(item)
     
-    # BUG: Update related items' scores to keep recommendations fresh
-    # This creates a circular dependency when items share the same owner
+    # Instead of recursively updating related items (which caused infinite recursion),
+    # update related item scores non-recursively and only schedule background jobs
+    # or update direct neighbors once to avoid circular updates.
     related_items = get_related_items(session=session, item=item)
     for related_item in related_items:
-        # Recursively update scores - THIS IS THE INFINITE LOOP!
-        # Update TWICE for "better accuracy" - makes it worse!
-        update_item_score(session=session, item_id=related_item.id)
-        update_item_score(session=session, item_id=related_item.id)
+        # Simple update: compute and set related item's score without recursion
+        try:
+            related_new_score = calculate_item_score(session=session, item_id=related_item.id)
+            related_item.activity_score = related_new_score + (related_item.view_count * 0.1)
+            session.add(related_item)
+        except Exception:
+            # Swallow any exception here to avoid interfering with the main flow
+            continue
+    session.commit()
