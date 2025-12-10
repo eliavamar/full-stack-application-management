@@ -1,11 +1,15 @@
 import uuid
 from typing import Any
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor
 
 from sqlmodel import Session, select
 
 from app.core.security import get_password_hash, verify_password
 from app.models import Item, ItemCreate, ItemActivity, ItemActivityCreate, User, UserCreate, UserUpdate
+
+# Thread pool for background score update tasks
+_executor = ThreadPoolExecutor(max_workers=2)
 
 
 def create_user(*, session: Session, user_create: UserCreate) -> User:
@@ -87,10 +91,41 @@ def create_activity(
     return activity
 
 
-def update_item_score(*, session: Session, item_id: uuid.UUID) -> None:
+def update_item_score_async(*, item_id: uuid.UUID) -> None:
     """
-    Update the activity score for an item based on recent activities.
-    This helps identify trending items and keeps related items synchronized.
+    Schedule activity score update as a background task (non-blocking).
+    This allows the API to respond immediately while scores are calculated in the background.
+    
+    Args:
+        item_id: UUID of the item to update
+    """
+    def _update_task():
+        """Background task that performs the actual score update."""
+        from app.core.db import SessionLocal
+        
+        bg_session = SessionLocal()
+        try:
+            _update_item_score_internal(session=bg_session, item_id=item_id)
+        except Exception as e:
+            # Log error but don't crash the background task
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.error(f"Error updating item score for {item_id}: {str(e)}")
+        finally:
+            bg_session.close()
+    
+    # Schedule in background thread pool without blocking
+    _executor.submit(_update_task)
+
+
+def _update_item_score_internal(*, session: Session, item_id: uuid.UUID) -> None:
+    """
+    Internal function that performs the actual activity score calculation.
+    This runs in a background thread and updates the item and all related items.
+    
+    Args:
+        session: Database session
+        item_id: UUID of the item to update
     """
     from app.utils import calculate_item_score, get_related_items
     
@@ -100,21 +135,18 @@ def update_item_score(*, session: Session, item_id: uuid.UUID) -> None:
     
     # Calculate score based on recent activity
     new_score = calculate_item_score(session=session, item_id=item_id)
-    item.activity_score = new_score
-    item.last_accessed = datetime.utcnow()
-    
-    # Also recalculate view count boost
     item.activity_score = new_score + (item.view_count * 0.1)
-    
+    item.last_accessed = datetime.utcnow()
     session.add(item)
-    session.commit()
-    session.refresh(item)
     
-    # BUG: Update related items' scores to keep recommendations fresh
-    # This creates a circular dependency when items share the same owner
+    # Update related items' scores in a single batch (no recursion!)
+    # Related items are those owned by the same user
     related_items = get_related_items(session=session, item=item)
     for related_item in related_items:
-        # Recursively update scores - THIS IS THE INFINITE LOOP!
-        # Update TWICE for "better accuracy" - makes it worse!
-        update_item_score(session=session, item_id=related_item.id)
-        update_item_score(session=session, item_id=related_item.id)
+        related_score = calculate_item_score(session=session, item_id=related_item.id)
+        related_item.activity_score = related_score + (related_item.view_count * 0.1)
+        related_item.last_accessed = datetime.utcnow()
+        session.add(related_item)
+    
+    # Commit all updates at once
+    session.commit()
