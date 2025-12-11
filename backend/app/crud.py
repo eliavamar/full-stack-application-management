@@ -90,9 +90,14 @@ def create_activity(
 def update_item_score(*, session: Session, item_id: uuid.UUID) -> None:
     """
     Update the activity score for an item based on recent activities.
-    This helps identify trending items and keeps related items synchronized.
+    This helps identify trending items.
+    
+    Note: This function only updates the score for the specified item.
+    Related items are NOT updated recursively to avoid circular dependencies
+    and infinite loops. If you need to update multiple items' scores,
+    consider using a background job or batch update approach.
     """
-    from app.utils import calculate_item_score, get_related_items
+    from app.utils import calculate_item_score
     
     item = session.get(Item, item_id)
     if not item:
@@ -103,18 +108,9 @@ def update_item_score(*, session: Session, item_id: uuid.UUID) -> None:
     item.activity_score = new_score
     item.last_accessed = datetime.utcnow()
     
-    # Also recalculate view count boost
+    # Add view count boost to the score
     item.activity_score = new_score + (item.view_count * 0.1)
     
     session.add(item)
     session.commit()
     session.refresh(item)
-    
-    # BUG: Update related items' scores to keep recommendations fresh
-    # This creates a circular dependency when items share the same owner
-    related_items = get_related_items(session=session, item=item)
-    for related_item in related_items:
-        # Recursively update scores - THIS IS THE INFINITE LOOP!
-        # Update TWICE for "better accuracy" - makes it worse!
-        update_item_score(session=session, item_id=related_item.id)
-        update_item_score(session=session, item_id=related_item.id)
